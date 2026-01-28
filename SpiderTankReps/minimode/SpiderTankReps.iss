@@ -18,9 +18,9 @@ objectdef obj_Configuration_SpiderTankReps inherits obj_Configuration_Base
 	
 	Setting(int, ReservedTargetLocks, SetReservedTargetLocks)
 	Setting(int, RepShieldThreshold, SetRepShieldThreshold)
-	Setting(int, StopRepShieldThreshold, SetRepShieldThreshold)
+	Setting(int, StopRepShieldThreshold, SetStopRepShieldThreshold)
 	Setting(int, RepArmorThreshold, SetRepArmorThreshold)
-	Setting(int, StopRepArmorThreshold, SetRepArmorThreshold)
+	Setting(int, StopRepArmorThreshold, SetStopRepArmorThreshold)
 	Setting(int, CapOutThreshold, SetCapOutThreshold)
 	Setting(int, LogLevelBar, SetLogLevelBar)
 }
@@ -47,7 +47,12 @@ objectdef obj_SpiderTankReps inherits obj_StateQueue
 	variable int MaxTarget = ${MyShip.MaxLockedTargets}
 
 	variable int64 MyRepTarget = 0
-	
+
+	; Chain break detection - track last successful rep time
+	variable int LastSuccessfulRepTime = 0
+	; Emergency rep tracking - CharID of critical target we're emergency repping
+	variable int64 EmergencyRepTarget = 0
+
 	variable obj_TargetList PCs
 	variable obj_TargetList NPCs
 	variable collection:int AttackTimestamp
@@ -145,10 +150,160 @@ objectdef obj_SpiderTankReps inherits obj_StateQueue
 		return ${Math.Calc[${Me.TargetCount} + ${Me.TargetingCount} + ${Config.ReservedTargetLocks}]}
 	}
 
+	; Helper method to validate if a target is valid for repping
+	; Checks: entity exists, not warping, in range of rep modules
+	member:bool IsValidRepTarget(int64 charID)
+	{
+		; Check entity exists
+		if !${Entity[CharID == ${charID}](exists)}
+		{
+			return FALSE
+		}
+
+		; Check entity is not warping (Mode 3 = MOVE_WARPING)
+		if ${Entity[CharID == ${charID}].Mode} == MOVE_WARPING
+		{
+			return FALSE
+		}
+
+		; Check range - use shield transporter range if we have them, otherwise armor projector range
+		variable float repRange = 0
+		if ${WeShieldRep} && ${Ship.ModuleList_ShieldTransporters.Count} > 0
+		{
+			repRange:Set[${Ship.ModuleList_ShieldTransporters.Range}]
+		}
+		elseif ${WeArmorRep} && ${Ship.ModuleList_ArmorProjectors.Count} > 0
+		{
+			repRange:Set[${Ship.ModuleList_ArmorProjectors.Range}]
+		}
+
+		if ${repRange} > 0 && ${Entity[CharID == ${charID}].Distance} > ${repRange}
+		{
+			return FALSE
+		}
+
+		return TRUE
+	}
+
+	; Find any valid fleet member to rep (used for chain break recovery)
+	member:int64 FindAnyValidFleetTarget()
+	{
+		variable index:entity fleetEntities
+		variable iterator fleetIter
+
+		EVE:QueryEntities[fleetEntities, "IsPC = 1 && Distance > 0 && IsFleetMember = 1"]
+		if ${fleetEntities.Used} > 0
+		{
+			fleetEntities:GetIterator[fleetIter]
+			if ${fleetIter:First(exists)}
+			{
+				do
+				{
+					; Skip ourselves
+					if ${fleetIter.Value.CharID} == ${Me.CharID}
+					{
+						continue
+					}
+					; Check if this is a valid rep target
+					if ${This.IsValidRepTarget[${fleetIter.Value.CharID}]}
+					{
+						return ${fleetIter.Value.CharID}
+					}
+				}
+				while ${fleetIter:Next(exists)}
+			}
+		}
+		return 0
+	}
+
+	; Find critical fleet member (below 30% HP) for emergency repping
+	member:int64 FindCriticalFleetTarget()
+	{
+		variable index:entity fleetEntities
+		variable iterator fleetIter
+		variable int64 criticalTarget = 0
+		variable float lowestHP = 100
+
+		EVE:QueryEntities[fleetEntities, "IsPC = 1 && Distance > 0 && IsFleetMember = 1"]
+		if ${fleetEntities.Used} > 0
+		{
+			fleetEntities:GetIterator[fleetIter]
+			if ${fleetIter:First(exists)}
+			{
+				do
+				{
+					; Skip ourselves
+					if ${fleetIter.Value.CharID} == ${Me.CharID}
+					{
+						continue
+					}
+
+					; Check if this is a valid rep target
+					if !${This.IsValidRepTarget[${fleetIter.Value.CharID}]}
+					{
+						continue
+					}
+
+					; Check HP based on rep type
+					variable float currentHP = 100
+					if ${WeShieldRep}
+					{
+						currentHP:Set[${fleetIter.Value.ShieldPct}]
+					}
+					elseif ${WeArmorRep}
+					{
+						currentHP:Set[${fleetIter.Value.ArmorPct}]
+					}
+
+					; If below 30% and lower than current lowest, mark as critical
+					if ${currentHP} < 30 && ${currentHP} < ${lowestHP}
+					{
+						lowestHP:Set[${currentHP}]
+						criticalTarget:Set[${fleetIter.Value.CharID}]
+					}
+				}
+				while ${fleetIter:Next(exists)}
+			}
+		}
+		return ${criticalTarget}
+	}
+
 	; Lock and rep the person below us in the list of participants, if we are the last row then we need to get the first row and lock and rep that person
 	method LockAndRepNext()
 	{
 		This:LogInfo["LockAndRepNext: Start"]
+
+		; Emergency rep override check (Fix #5)
+		; If assigned chain partner is above 90% HP but another fleet member is below 30%, temporarily rep the critical target
+		variable int64 criticalTarget = ${This.FindCriticalFleetTarget}
+		if ${criticalTarget} != 0 && ${MyRepTarget} != 0
+		{
+			; Check if our normal chain partner is healthy (above 90%)
+			variable float partnerHP = 100
+			if ${WeShieldRep}
+			{
+				partnerHP:Set[${Entity[CharID == ${MyRepTarget}].ShieldPct}]
+			}
+			elseif ${WeArmorRep}
+			{
+				partnerHP:Set[${Entity[CharID == ${MyRepTarget}].ArmorPct}]
+			}
+
+			if ${partnerHP} > 90 && ${criticalTarget} != ${MyRepTarget}
+			{
+				This:LogWarning["EMERGENCY REP: Chain partner at ${partnerHP}% HP, switching to critical target ${criticalTarget}"]
+				EmergencyRepTarget:Set[${criticalTarget}]
+			}
+			else
+			{
+				EmergencyRepTarget:Set[0]
+			}
+		}
+		else
+		{
+			EmergencyRepTarget:Set[0]
+		}
+
 		; Ensure our fleetList table exists
 		if (!${SpiderTankData.TableExists["fleetList"]})
 		{
@@ -156,7 +311,7 @@ objectdef obj_SpiderTankReps inherits obj_StateQueue
 			return
 		}
 		This:LogInfo["LockAndRepNext: table exists lets go!"]
-		; Attempt to get the next row after our own character 
+		; Attempt to get the next row after our own character
 		variable sqlitequery nextRowQuery
 		nextRowQuery:Set[${SpiderTankData.ExecQuery["SELECT * FROM fleetList WHERE CharID > ${Me.ID} ORDER BY CharID ASC LIMIT 1;"]}]
 		This:LogInfo["LockAndRepNext: nextRowQuery.NumRows = ${nextRowQuery.NumRows}"]
@@ -185,31 +340,71 @@ objectdef obj_SpiderTankReps inherits obj_StateQueue
 		}
 		nextRowQuery:Finalize
 
-		; Lock our rep target and start repping them
-		This:LogInfo["LockAndRepNext: is our rep target set? ${MyRepTarget}"]
-		if ${MyRepTarget} != 0
+		; Determine actual rep target (emergency override or normal chain partner)
+		variable int64 actualRepTarget = ${MyRepTarget}
+		if ${EmergencyRepTarget} != 0
 		{
-			This:LogInfo["LockAndRepNext: MyRepTarget is locked? ". ${Entity[CharID == ${MyRepTarget}].IsLockedTarget} . " & BeingTargeted? " . ${Entity[CharID == ${MyRepTarget}].BeingTargeted}]
-			if (!${Entity[CharID == ${MyRepTarget}].IsLockedTarget} && !${Entity[CharID == ${MyRepTarget}].BeingTargeted})
+			actualRepTarget:Set[${EmergencyRepTarget}]
+			This:LogInfo["Using emergency rep target: ${actualRepTarget}"]
+		}
+
+		; Validate rep target before proceeding (Fix #3)
+		if ${actualRepTarget} != 0 && !${This.IsValidRepTarget[${actualRepTarget}]}
+		{
+			This:LogWarning["Rep target ${actualRepTarget} is not valid (out of range or warping)"]
+
+			; Chain break detection (Fix #4) - check if we haven't had a successful rep in ~10 seconds
+			if ${Math.Calc[${Time.Timestamp} - ${LastSuccessfulRepTime}]} > 10
 			{
-				Entity[CharID == ${MyRepTarget}]:LockTarget
-				This:LogInfo["Locking target:  ${MyRepTarget}"]
+				This:LogWarning["CHAIN BREAK DETECTED: No successful rep in 10+ seconds, attempting recovery"]
+				; Try to find any valid fleet member to rep
+				variable int64 recoveryTarget = ${This.FindAnyValidFleetTarget}
+				if ${recoveryTarget} != 0
+				{
+					actualRepTarget:Set[${recoveryTarget}]
+					This:LogInfo["Chain break recovery: Found alternate target ${actualRepTarget}"]
+				}
+				else
+				{
+					This:LogWarning["Chain break recovery: No valid fleet targets found"]
+					return
+				}
+			}
+			else
+			{
+				return
+			}
+		}
+
+		; Lock our rep target and start repping them
+		This:LogInfo["LockAndRepNext: is our rep target set? ${actualRepTarget}"]
+		if ${actualRepTarget} != 0
+		{
+			This:LogInfo["LockAndRepNext: Target is locked? ". ${Entity[CharID == ${actualRepTarget}].IsLockedTarget} . " & BeingTargeted? " . ${Entity[CharID == ${actualRepTarget}].BeingTargeted}]
+			if (!${Entity[CharID == ${actualRepTarget}].IsLockedTarget} && !${Entity[CharID == ${actualRepTarget}].BeingTargeted})
+			{
+				Entity[CharID == ${actualRepTarget}]:LockTarget
+				This:LogInfo["Locking target:  ${actualRepTarget}"]
 			}
 
 			; Activate shield rep if we have them
-			if (${Entity[CharID == ${MyRepTarget}].IsLockedTarget} && ${WeShieldRep})
+			if (${Entity[CharID == ${actualRepTarget}].IsLockedTarget} && ${WeShieldRep})
 			{
-				Ship.ModuleList_ShieldTransporters:ActivateAll[${Entity[CharID == ${MyRepTarget}]}]
-				Ship.ModuleList_EnergyTransfer:ActivateAll[${Entity[CharID == ${MyRepTarget}]}]
-				This:LogInfo["Activating shield rep on: ${MyRepTarget}"]
+				Ship.ModuleList_ShieldTransporters:ActivateAll[${Entity[CharID == ${actualRepTarget}].ID}]
+				Ship.ModuleList_EnergyTransfer:ActivateAll[${Entity[CharID == ${actualRepTarget}].ID}]
+				This:LogInfo["Activating shield rep on: ${actualRepTarget}"]
+				; Update last successful rep time
+				LastSuccessfulRepTime:Set[${Time.Timestamp}]
 			}
 
 			; Activate armor rep if we have them
-			if (${Entity[CharID == ${MyRepTarget}].IsLockedTarget} && ${WeArmorRep})
+			if (${Entity[CharID == ${actualRepTarget}].IsLockedTarget} && ${WeArmorRep})
 			{
-				Ship.ModuleList_ArmorProjectors:ActivateAll[${Entity[CharID == ${MyRepTarget}]}]
-				Ship.ModuleList_EnergyTransfer:ActivateAll[${Entity[CharID == ${MyRepTarget}]}]
-				This:LogInfo["Activating armor rep on: ${MyRepTarget}"]
+				Ship.ModuleList_ArmorProjectors:ActivateAll[${Entity[CharID == ${actualRepTarget}].ID}]
+				Ship.ModuleList_EnergyTransfer:ActivateAll[${Entity[CharID == ${actualRepTarget}].ID}]
+				This:LogInfo["Activating armor rep on: ${actualRepTarget}"]
+				; Update last successful rep time
+				LastSuccessfulRepTime:Set[${Time.Timestamp}]
 			}
 		}
 
@@ -243,11 +438,11 @@ objectdef obj_SpiderTankReps inherits obj_StateQueue
 				{
 					if ${MyShip.CapacitorPct.Int} < ${Config.CapOutThreshold}
 					{
-						Ship.ModuleList_ArmorProjectors:DeactivateAll			
+						Ship.ModuleList_ShieldTransporters:DeactivateAll
 					}
 					if ${StopRepHelper2.Value.ShieldPct} > ${Config.StopRepShieldThreshold}
 					{
-						Ship.ModuleList_ArmorProjectors:DeactivateOn[${StopRepHelper2.Value.ID}]
+						Ship.ModuleList_ShieldTransporters:DeactivateOn[${StopRepHelper2.Value.ID}]
 					}
 				}
 			}
@@ -256,6 +451,10 @@ objectdef obj_SpiderTankReps inherits obj_StateQueue
 	}
 	member:bool SpiderTankReps()
 	{
+		if !${ISXEVE.IsReady}
+		{
+			return FALSE
+		}
 		if ${Me.InStation}
 		{
 			return FALSE
@@ -274,7 +473,8 @@ objectdef obj_SpiderTankReps inherits obj_StateQueue
 		This:ParticipantTrigger
 		This:DetermineRepType
 		This:LockAndRepNext
-		
+		This:RepDeactivation
+
 		return FALSE
 	}
 }
